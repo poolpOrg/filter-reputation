@@ -34,7 +34,7 @@ const (
 var degradationFactors = map[string]float64{
 	"IP":         1.0,
 	"rDNS":       0.8,
-	"hostname":   0.6,
+	"heloname":   0.6,
 	"mailFrom":   0.4,
 	"mailDomain": 0.2,
 	"recipient":  0.5,
@@ -43,7 +43,7 @@ var degradationFactors = map[string]float64{
 const (
 	ipWeight       = 0.5
 	rdnsWeight     = 0.3
-	hostnameWeight = 0.2
+	helonameWeight = 0.2
 )
 
 func clamp(value float64, min float64, max float64) float64 {
@@ -61,7 +61,7 @@ func applyPenalty(resourceType string, reputationScore float64) float64 {
 }
 
 func applyReward(resourceType string, reputationScore float64) float64 {
-	reward := baseReward
+	reward := baseReward * degradationFactors[resourceType]
 	return clamp(reputationScore+reward, 0.0, 1.0)
 }
 
@@ -117,21 +117,21 @@ func (r *Reputation) Feedback(session *SessionData) {
 	// Calculate the feedback for each resource
 	ipFeedback := overallReputation * ipWeight
 	rdnsFeedback := overallReputation * rdnsWeight
-	hostnameFeedback := overallReputation * hostnameWeight
+	hostnameFeedback := overallReputation * helonameWeight
 
 	// Update the resource reputations with the feedback
 	session.ipReputation = clamp((session.ipReputation+ipFeedback)/2, 0.0, 1.0)
 	session.rdnsReputation = clamp((session.rdnsReputation+rdnsFeedback)/2, 0.0, 1.0)
-	session.hostnameReputation = clamp((session.hostnameReputation+hostnameFeedback)/2, 0.0, 1.0)
+	session.heloReputation = clamp((session.heloReputation+hostnameFeedback)/2, 0.0, 1.0)
 
 	// Update the global reputation scores
 	r.ipAddress[session.ip.String()] = session.ipReputation
 	r.rdns[session.rDNS] = session.rdnsReputation
-	r.hostname[session.heloname] = session.hostnameReputation
+	r.hostname[session.heloname] = session.heloReputation
 
 	fmt.Fprintf(os.Stderr, "Reputation IP updated to: %.2f\n", session.ipReputation)
 	fmt.Fprintf(os.Stderr, "Reputation RDNS updated to: %.2f\n", session.rdnsReputation)
-	fmt.Fprintf(os.Stderr, "Reputation Hostname updated to: %.2f\n", session.hostnameReputation)
+	fmt.Fprintf(os.Stderr, "Reputation Hostname updated to: %.2f\n", session.heloReputation)
 
 }
 
@@ -159,15 +159,15 @@ type SessionData struct {
 	failedMail int
 	failedRcpt int
 
-	overallReputation  float64
-	ipReputation       float64
-	rdnsReputation     float64
-	hostnameReputation float64
+	overallReputation float64
+	ipReputation      float64
+	rdnsReputation    float64
+	heloReputation    float64
 }
 
 func linkConnectCb(timestamp time.Time, session filter.Session, rdns string, fcrdns string, src net.Addr, dest net.Addr) {
 	session.Get().(*SessionData).ip = src.(*net.TCPAddr).IP
-	session.Get().(*SessionData).rDNS = rdns
+	session.Get().(*SessionData).rDNS = strings.ToLower(rdns)
 	session.Get().(*SessionData).hasReverseDNS = rdns != "<unknown>"
 	session.Get().(*SessionData).hasFcReverseDNS = fcrdns != "ok"
 
@@ -209,14 +209,28 @@ func linkIdentifyCb(timestamp time.Time, session filter.Session, method string, 
 
 	ipScore := reputation.IPAddress(session.Get().(*SessionData).ip)
 	rdnsScore := reputation.ReverseDNS(session.Get().(*SessionData).rDNS)
-	hostnameScore := reputation.Hostname(session.Get().(*SessionData).heloname)
+	helonameScore := reputation.Hostname(session.Get().(*SessionData).heloname)
 
-	overallReputation := ((ipScore * ipWeight) + (rdnsScore * rdnsWeight) + (hostnameScore * hostnameWeight)) / 3
+	if session.Get().(*SessionData).hasReverseDNS {
+		if strings.ToLower(hostname) != session.Get().(*SessionData).rDNS {
+			ipScore = applyPenalty("heloname", ipScore)
+			rdnsScore = applyPenalty("heloname", rdnsScore)
+			helonameScore = applyPenalty("heloname", helonameScore)
+		} else {
+			ipScore = applyReward("heloname", ipScore)
+			rdnsScore = applyReward("heloname", rdnsScore)
+			helonameScore = applyReward("heloname", helonameScore)
+		}
+	}
+	session.Get().(*SessionData).heloReputation = helonameScore
+
+	overallReputation := ((ipScore * ipWeight) + (rdnsScore * rdnsWeight) + (helonameScore * helonameWeight)) / 3
 	session.Get().(*SessionData).overallReputation = overallReputation
 	fmt.Fprintf(os.Stderr, "%s: %s: reputation: %f\n", timestamp, session, overallReputation)
 }
 
 func linkAuthCb(timestamp time.Time, session filter.Session, result string, username string) {
+	// reward for authenticating, penalize for failing
 	if result != "ok" {
 		session.Get().(*SessionData).failedAuth++
 	} else {
@@ -225,18 +239,24 @@ func linkAuthCb(timestamp time.Time, session filter.Session, result string, user
 }
 
 func linkTLSCb(timestamp time.Time, session filter.Session, tlsString string) {
+	// reward for starting TLS
 	session.Get().(*SessionData).hasStartTLS = true
 }
 
 func txResetCb(timestamp time.Time, session filter.Session, messageId string) {
+	// penalize if the ratio of reset / commit is too high
 	session.Get().(*SessionData).rsetCount += 1
 }
 
 func txBeginCb(timestamp time.Time, session filter.Session, messageId string) {
+	// reward for starting a transaction
 	session.Get().(*SessionData).txBegin += 1
 }
 
 func txMailCb(timestamp time.Time, session filter.Session, messageId string, result string, from string) {
+	// reward each valid sender and penalize each invalid sender
+	// compute a local reputation score for the transaction ... and update the overall reputation (with weight)
+
 	session.Get().(*SessionData).txMailFrom += 1
 	if result != "ok" {
 		session.Get().(*SessionData).failedMail++
@@ -248,6 +268,7 @@ func txMailCb(timestamp time.Time, session filter.Session, messageId string, res
 }
 
 func txRcptCb(timestamp time.Time, session filter.Session, messageId string, result string, to string) {
+	// reward each valid recipient and penalize each invalid recipient
 	session.Get().(*SessionData).txRcptTo += 1
 	if result != "ok" {
 		session.Get().(*SessionData).failedRcpt++
@@ -259,14 +280,17 @@ func txRcptCb(timestamp time.Time, session filter.Session, messageId string, res
 }
 
 func txDataCb(timestamp time.Time, session filter.Session, messageId string, result string) {
+	// reward for sending data
 	session.Get().(*SessionData).txData += 1
 }
 
 func txCommitCb(timestamp time.Time, session filter.Session, messageId string, messageSize int) {
+	// reward for successful commit
 	session.Get().(*SessionData).txCommit += 1
 }
 
 func txRollbackCb(timestamp time.Time, session filter.Session, messageId string) {
+	// penalty for rollback
 	session.Get().(*SessionData).txRollback += 1
 }
 
