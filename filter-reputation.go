@@ -21,6 +21,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,15 @@ import (
 
 var ipScoring map[string][]Scoring = make(map[string][]Scoring)
 var ipScoringMutex sync.Mutex
+
+var rdnsScoring map[string][]Scoring = make(map[string][]Scoring)
+var rdnsScoringMutex sync.Mutex
+
+var heloScoring map[string][]Scoring = make(map[string][]Scoring)
+var heloScoringMutex sync.Mutex
+
+var domainScoring map[string][]Scoring = make(map[string][]Scoring)
+var domainScoringMutex sync.Mutex
 
 func init() {
 	go func() {
@@ -44,6 +54,39 @@ func init() {
 				}
 			}
 			ipScoringMutex.Unlock()
+
+			rdnsScoringMutex.Lock()
+			for rdns, scoring := range rdnsScoring {
+				if len(scoring) > 100 {
+					rdnsScoring[rdns] = scoring[len(scoring)-100:]
+				} else if scoring[len(scoring)-1].Timestamp.Add(5 * 24 * time.Hour).Before(time.Now()) {
+					fmt.Fprintf(os.Stderr, "last event over five days ago, deleting scoring for %s\n", rdns)
+					delete(rdnsScoring, rdns)
+				}
+			}
+			rdnsScoringMutex.Unlock()
+
+			heloScoringMutex.Lock()
+			for helo, scoring := range heloScoring {
+				if len(scoring) > 100 {
+					heloScoring[helo] = scoring[len(scoring)-100:]
+				} else if scoring[len(scoring)-1].Timestamp.Add(5 * 24 * time.Hour).Before(time.Now()) {
+					fmt.Fprintf(os.Stderr, "last event over five days ago, deleting scoring for %s\n", helo)
+					delete(heloScoring, helo)
+				}
+			}
+			heloScoringMutex.Unlock()
+
+			domainScoringMutex.Lock()
+			for domain, scoring := range domainScoring {
+				if len(scoring) > 100 {
+					domainScoring[domain] = scoring[len(scoring)-100:]
+				} else if scoring[len(scoring)-1].Timestamp.Add(5 * 24 * time.Hour).Before(time.Now()) {
+					fmt.Fprintf(os.Stderr, "last event over five days ago, deleting scoring for %s\n", domain)
+					delete(domainScoring, domain)
+				}
+			}
+			domainScoringMutex.Unlock()
 		}
 	}()
 }
@@ -65,6 +108,7 @@ type Transaction struct {
 	endTime   time.Time
 
 	mailFromOK     bool
+	mailDomain     string
 	rcptToOK       int
 	rcptToTempfail int
 	rcptToPermfail int
@@ -80,7 +124,7 @@ type SessionData struct {
 	disconnectTime time.Time
 
 	addr   net.IP
-	rdns   bool
+	rdns   string
 	fcrdns bool
 
 	cmdHelo  bool
@@ -97,6 +141,8 @@ type SessionData struct {
 	nResets int
 
 	transactions []*Transaction
+
+	currentReputation []float64
 }
 
 func scoreTransaction(tx *Transaction) float64 {
@@ -166,7 +212,7 @@ func scoreSession(session *SessionData) float64 {
 	}
 
 	// Add points for reverse DNS success
-	if session.rdns {
+	if session.rdns != "" {
 		baseScore += rdnsWeight
 	}
 
@@ -248,21 +294,37 @@ func linkConnectCb(timestamp time.Time, session filter.Session, rdns string, fcr
 	}
 
 	session.Get().(*SessionData).transactions = make([]*Transaction, 0)
+	session.Get().(*SessionData).currentReputation = make([]float64, 0)
 	session.Get().(*SessionData).connectTime = timestamp
 	session.Get().(*SessionData).addr = addr.IP
-	session.Get().(*SessionData).rdns = rdns != "<unknown>"
+	if rdns != "<unknown>" {
+		session.Get().(*SessionData).rdns = rdns
+	}
 	session.Get().(*SessionData).fcrdns = fcrdns == "ok" || fcrdns == "pass"
-
-	var score float64
 
 	ipScoringMutex.Lock()
 	scorings, exists := ipScoring[session.Get().(*SessionData).addr.String()]
 	ipScoringMutex.Unlock()
-	if !exists || len(scorings) < 5 {
-		score = 0.5
+	if exists && len(scorings) > 5 {
+		session.Get().(*SessionData).currentReputation = append(session.Get().(*SessionData).currentReputation, aggregateScoring(scorings).Score)
 	} else {
-		score = aggregateScoring(scorings).Score
+		session.Get().(*SessionData).currentReputation = append(session.Get().(*SessionData).currentReputation, 0.5)
 	}
+
+	if session.Get().(*SessionData).rdns != "" {
+		rdnsScoringMutex.Lock()
+		scorings, exists = rdnsScoring[session.Get().(*SessionData).rdns]
+		rdnsScoringMutex.Unlock()
+		if exists && len(scorings) > 5 {
+			session.Get().(*SessionData).currentReputation = append(session.Get().(*SessionData).currentReputation, aggregateScoring(scorings).Score)
+		} else {
+			session.Get().(*SessionData).currentReputation = append(session.Get().(*SessionData).currentReputation, 0.5)
+		}
+	} else {
+		session.Get().(*SessionData).currentReputation = append(session.Get().(*SessionData).currentReputation, 0.0)
+	}
+
+	score := (session.Get().(*SessionData).currentReputation[0] + session.Get().(*SessionData).currentReputation[1]) / 2
 	fmt.Fprintf(os.Stderr, "connect: ip-address=%s score=%.04f\n", addr.IP.String(), score)
 }
 
@@ -275,6 +337,26 @@ func linkDisconnectCb(timestamp time.Time, session filter.Session) {
 	ipScoringMutex.Lock()
 	ipScoring[session.Get().(*SessionData).addr.String()] = append(ipScoring[session.Get().(*SessionData).addr.String()], summarizeSession(session.Get().(*SessionData)))
 	ipScoringMutex.Unlock()
+
+	if session.Get().(*SessionData).rdns != "" {
+		rdnsScoringMutex.Lock()
+		rdnsScoring[session.Get().(*SessionData).rdns] = append(rdnsScoring[session.Get().(*SessionData).rdns], summarizeSession(session.Get().(*SessionData)))
+		rdnsScoringMutex.Unlock()
+	}
+
+	if session.Get().(*SessionData).heloname != "" {
+		heloScoringMutex.Lock()
+		heloScoring[session.Get().(*SessionData).heloname] = append(heloScoring[session.Get().(*SessionData).heloname], summarizeSession(session.Get().(*SessionData)))
+		heloScoringMutex.Unlock()
+	}
+
+	for _, tx := range session.Get().(*SessionData).transactions {
+		if tx.mailDomain != "" {
+			domainScoringMutex.Lock()
+			domainScoring[tx.mailDomain] = append(domainScoring[tx.mailDomain], summarizeSession(session.Get().(*SessionData)))
+			domainScoringMutex.Unlock()
+		}
+	}
 
 	fmt.Fprintf(os.Stderr, "disconnect: ip-address=%s score=%.04f\n", session.Get().(*SessionData).addr.String(), scoreSession(session.Get().(*SessionData)))
 }
@@ -289,7 +371,20 @@ func linkIdentifyCb(timestamp time.Time, session filter.Session, method string, 
 	if method == "EHLO" {
 		session.Get().(*SessionData).cmdEhlo = true
 	}
-	session.Get().(*SessionData).heloname = hostname
+	session.Get().(*SessionData).heloname = strings.ToLower(hostname)
+
+	heloScoringMutex.Lock()
+	scorings, exists := heloScoring[session.Get().(*SessionData).heloname]
+	heloScoringMutex.Unlock()
+	if exists && len(scorings) > 5 {
+		session.Get().(*SessionData).currentReputation = append(session.Get().(*SessionData).currentReputation, aggregateScoring(scorings).Score)
+	} else {
+		session.Get().(*SessionData).currentReputation = append(session.Get().(*SessionData).currentReputation, 0.5)
+	}
+
+	score := (session.Get().(*SessionData).currentReputation[0] + session.Get().(*SessionData).currentReputation[1] + session.Get().(*SessionData).currentReputation[2]) / 3
+
+	fmt.Fprintf(os.Stderr, "identify: ip-address=%s score=%.04f\n", session.Get().(*SessionData).addr.String(), score)
 }
 
 func linkAuthCb(timestamp time.Time, session filter.Session, result string, username string) {
@@ -328,17 +423,21 @@ func txBeginCb(timestamp time.Time, session filter.Session, messageId string) {
 		beginTime: timestamp,
 	}
 	session.Get().(*SessionData).transactions = append(session.Get().(*SessionData).transactions, tx)
-	fmt.Fprintf(os.Stderr, "txBegin: %s\n", timestamp)
 }
 
 func txMailCb(timestamp time.Time, session filter.Session, messageId string, result string, from string) {
 	if session.Get().(*SessionData).skip {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "txMail: %s\n", timestamp)
+
 	tx := session.Get().(*SessionData).transactions[len(session.Get().(*SessionData).transactions)-1]
 	if result == "ok" {
 		tx.mailFromOK = true
+	}
+	if tx.mailDomain != "" {
+		if strings.Contains(from, "@") {
+			tx.mailDomain = strings.ToLower(strings.Split(from, "@")[1])
+		}
 	}
 }
 
@@ -371,8 +470,6 @@ func txCommitCb(timestamp time.Time, session filter.Session, messageId string, m
 	tx := session.Get().(*SessionData).transactions[len(session.Get().(*SessionData).transactions)-1]
 	tx.endTime = timestamp
 	tx.committed = true
-
-	fmt.Fprintf(os.Stderr, "txCommit: score=%.04f\n", scoreTransaction(tx))
 }
 
 func txRollbackCb(timestamp time.Time, session filter.Session, messageId string) {
@@ -381,8 +478,6 @@ func txRollbackCb(timestamp time.Time, session filter.Session, messageId string)
 	}
 	tx := session.Get().(*SessionData).transactions[len(session.Get().(*SessionData).transactions)-1]
 	tx.endTime = timestamp
-
-	fmt.Fprintf(os.Stderr, "txRollback: score=%.04f\n", scoreTransaction(tx))
 }
 
 func main() {
